@@ -1,9 +1,12 @@
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from copy import deepcopy
 from collections import defaultdict
-
+from augmentations.transforms_adacontrast import get_tta_transforms
 import torch
 import torch.nn as nn
-
+import math
 
 class SynTTA(nn.Module):
     def __init__(self, cfg, model, num_classes):
@@ -14,6 +17,7 @@ class SynTTA(nn.Module):
         self.episodic = cfg.MODEL.EPISODIC
         self.dataset_name = cfg.CORRUPTION.DATASET
         self.steps = cfg.OPTIM.STEPS
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         assert self.steps > 0, "requires >= 1 step(s) to forward and update"
 
         # configure model and optimizer
@@ -33,7 +37,7 @@ class SynTTA(nn.Module):
         self.model_states, self.optimizer_state = self.copy_model_and_optimizer()
 
         # follow the Self-Training setting in RoTTA https://arxiv.org/abs/2303.13899
-        self.mem = ClassBalanceBank(capacity=cfg.SYNTTA.MEMORY_SIZE, num_class=num_classes, lambda_t=cfg.SYNTTA.LAMBDA_T, lambda_u=cfg.SYNTTA.LAMBDA_U)
+        self.mem = CSTU(capacity=cfg.SYNTTA.MEMORY_SIZE, num_class=num_classes, lambda_t=cfg.SYNTTA.LAMBDA_T, lambda_u=cfg.SYNTTA.LAMBDA_U)
         self.model_ema = self.build_ema(self.model)
         self.transform = get_tta_transforms(cfg)
         self.nu = cfg.SYNTTA.NU
@@ -180,7 +184,7 @@ class SynTTA(nn.Module):
                 NewBN = GMBN2d
             else:
                 raise RuntimeError()
-            momentum_bn = NewBN(bn_layer, self.cfg.SYNTTA.ALPHA, self.cfg.SYNTTA.GAMMA)
+            momentum_bn = NewBN(bn_layer, self.cfg.SYNTTA.GAMMA)
             momentum_bn.requires_grad_(True)
             set_named_submodule(self.model, name, momentum_bn)
         return self.model
@@ -235,6 +239,13 @@ class SynTTA(nn.Module):
     def copy_model(model):
         coppied_model = deepcopy(model)
         return coppied_model
+
+    @staticmethod
+    def build_ema(model):
+        ema_model = deepcopy(model)
+        for param in ema_model.parameters():
+            param.detach_()
+        return ema_model
 
 class MomentumBN(nn.Module):
     def __init__(self, bn_layer: nn.BatchNorm2d, momentum: float):
@@ -363,119 +374,106 @@ class MemoryItem:
 
         return self.data is None
 
-class ClassBalanceBank:
-
-    def __init__(self, capacity: int, num_class: int, alpha: float = 1.0, beta: float = 1.0):
+class CSTU:
+    def __init__(self, capacity, num_class, lambda_t=1.0, lambda_u=1.0):
         self.capacity = capacity
         self.num_class = num_class
-        self.alpha = alpha  # Weight for the uncertainty component
-        self.beta = beta    # Weight for the class balance component
-        self.per_class_limit = max(1, capacity // num_class)
-        self.bank: list[list[MemoryItem]] = [[] for _ in range(self.num_class)]
+        self.per_class = self.capacity / self.num_class
+        self.lambda_t = lambda_t
+        self.lambda_u = lambda_u
 
-    def get_occupancy(self) -> int:
-        return sum(len(class_list) for class_list in self.bank)
+        self.data: list[list[MemoryItem]] = [[] for _ in range(self.num_class)]
 
-    def get_class_distribution(self) -> list[int]:
-        return [len(class_list) for class_list in self.bank]
+    def get_occupancy(self):
+        occupancy = 0
+        for data_per_cls in self.data:
+            occupancy += len(data_per_cls)
+        return occupancy
 
-    def push(self, sample: tuple):
-        assert len(sample) == 3
-        data, prediction, uncertainty = sample
-        
-        new_item = MemoryItem(data=data, uncertainty=uncertainty, age=0)
-        # Calculate the eviction score for the new sample
-        new_score = self.calculate_eviction_score(uncertainty, prediction)
+    def per_class_dist(self):
+        per_class_occupied = [0] * self.num_class
+        for cls, class_list in enumerate(self.data):
+            per_class_occupied[cls] = len(class_list)
 
-        if self._find_and_prepare_slot(prediction, new_score):
-            self.bank[prediction].append(new_item)
-        
-        # Increment the age of all existing items in the bank
-        self._increment_ages()
+        return per_class_occupied
 
-    def _find_and_prepare_slot(self, class_idx: int, new_score: float) -> bool:
-        class_list = self.bank[class_idx]
-        class_occupancy = len(class_list)
-        total_occupancy = self.get_occupancy()
+    def add_instance(self, instance):
+        assert (len(instance) == 3)
+        x, prediction, uncertainty = instance
+        new_item = MemoryItem(data=x, uncertainty=uncertainty, age=0)
+        new_score = self.heuristic_score(0, uncertainty)
+        if self.remove_instance(prediction, new_score):
+            self.data[prediction].append(new_item)
+        self.add_age()
 
-        # Case 1: The target class is not yet full to its limit.
-        if class_occupancy < self.per_class_limit:
-            # Subcase 1a: The entire bank is not full, so no eviction is needed.
-            if total_occupancy < self.capacity:
+    def remove_instance(self, cls, score):
+        class_list = self.data[cls]
+        class_occupied = len(class_list)
+        all_occupancy = self.get_occupancy()
+        if class_occupied < self.per_class:
+            if all_occupancy < self.capacity:
                 return True
-            # Subcase 1b: The bank is full, so a sample must be evicted from the most populated class.
             else:
-                majority_class_indices = self._get_majority_class_indices()
-                return self._evict_worst_sample(majority_class_indices, new_score)
-        # Case 2: The target class is full, so a sample must be evicted from this class.
+                majority_classes = self.get_majority_classes()
+                return self.remove_from_classes(majority_classes, score)
         else:
-            return self._evict_worst_sample([class_idx], new_score)
+            return self.remove_from_classes([cls], score)
 
-    def _evict_worst_sample(self, candidate_classes: list[int], new_score: float) -> bool:
-        eviction_candidate = {'class_idx': None, 'sample_idx': None, 'score': -1}
+    def remove_from_classes(self, classes: list[int], score_base):
+        max_class = None
+        max_index = None
+        max_score = None
+        for cls in classes:
+            for idx, item in enumerate(self.data[cls]):
+                uncertainty = item.uncertainty
+                age = item.age
+                score = self.heuristic_score(age=age, uncertainty=uncertainty)
+                if max_score is None or score >= max_score:
+                    max_score = score
+                    max_index = idx
+                    max_class = cls
 
-        for class_idx in candidate_classes:
-            for sample_idx, item in enumerate(self.bank[class_idx]):
-                # Calculate the eviction score for an existing sample
-                score = self.calculate_eviction_score(item.uncertainty, class_idx)
-                if score >= eviction_candidate['score']:
-                    eviction_candidate.update({
-                        'class_idx': class_idx, 
-                        'sample_idx': sample_idx, 
-                        'score': score
-                    })
-        
-        # If no candidate was found (e.g., candidate_classes was empty), allow adding.
-        if eviction_candidate['class_idx'] is None:
+        if max_class is not None:
+            if max_score > score_base:
+                self.data[max_class].pop(max_index)
+                return True
+            else:
+                return False
+        else:
             return True
 
-        # If the worst sample in the bank has a higher score than the new sample, evict it.
-        if eviction_candidate['score'] > new_score:
-            self.bank[eviction_candidate['class_idx']].pop(eviction_candidate['sample_idx'])
-            return True
-        # Otherwise, the new sample is not 'good' enough to be added.
-        else:
-            return False
+    def get_majority_classes(self):
+        per_class_dist = self.per_class_dist()
+        max_occupied = max(per_class_dist)
+        classes = []
+        for i, occupied in enumerate(per_class_dist):
+            if occupied == max_occupied:
+                classes.append(i)
 
-    def _get_majority_class_indices(self) -> list[int]:
-        class_dist = self.get_class_distribution()
-        if not any(class_dist):
-            return []
-        max_occupancy = max(class_dist)
-        return [i for i, occupancy in enumerate(class_dist) if occupancy == max_occupancy]
+        return classes
 
-    def calculate_eviction_score(self, uncertainty: float, class_idx: int) -> float:
-        total_occupancy = self.get_occupancy()
-        if total_occupancy == 0:
-            return self.alpha * uncertainty
+    def heuristic_score(self, age, uncertainty):
+        return self.lambda_t * 1 / (1 + math.exp(-age / self.capacity)) + self.lambda_u * uncertainty / math.log(self.num_class)
 
-        class_occupancy = len(self.bank[class_idx])
-        
-        balance_factor = class_occupancy / total_occupancy
-        
-        score = (self.alpha * uncertainty) + (self.beta * balance_factor)
-        return score
-
-    def _increment_ages(self):
-        for class_list in self.bank:
+    def add_age(self):
+        for class_list in self.data:
             for item in class_list:
                 item.increase_age()
+        return
 
-    def get_all_samples(self) -> tuple[list, list]:
-        all_data = []
-        all_ages = []
+    def get_memory(self):
+        tmp_data = []
+        tmp_age = []
 
-        for class_list in self.bank:
+        for class_list in self.data:
             for item in class_list:
-                all_data.append(item.data)
-                all_ages.append(item.age)
-        
-        if self.capacity > 0:
-            normalized_ages = [age / self.capacity for age in all_ages]
-        else:
-            normalized_ages = [0] * len(all_ages)
+                tmp_data.append(item.data)
+                tmp_age.append(item.age)
 
-        return all_data, normalized_ages
+        tmp_age = [x / self.capacity for x in tmp_age]
+
+        return tmp_data, tmp_age
+
     
 def timeliness_reweighting(ages):
     if isinstance(ages, list):

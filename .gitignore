@@ -1,0 +1,6 @@
+ckpt
+**pycache__/
+*.log
+*.tmp
+.DS_Store
+.vscode/
